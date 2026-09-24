@@ -228,7 +228,7 @@ fn dav_http_date(epoch: i64) -> str {
 }
 
 // Един ресурс в multistatus. collection=1 слага <D:collection/>.
-fn dav_response(href: str, name: str, collection: i64, size: i64, mime: str, etag: str, mtime: str) -> str {
+fn dav_response(href: str, name: str, collection: i64, size: i64, mime: str, etag: str, mtime: str, extra: str) -> str {
     let mut b = "<D:response><D:href>"
     b = concat(b, xml_escape_text(dav_href_escape(href)))
     b = concat(b, "</D:href><D:propstat><D:prop>")
@@ -250,10 +250,154 @@ fn dav_response(href: str, name: str, collection: i64, size: i64, mime: str, eta
     if mtime != "" {
         b = concat(b, concat("<D:getlastmodified>", concat(xml_escape_text(mtime), "</D:getlastmodified>")))
     }
+    b = concat(b, extra)
     b = concat(b, "</D:prop><D:status>")
     b = concat(b, dav_status(200))
     b = concat(b, "</D:status></D:propstat></D:response>")
     return b
+}
+
+// Родител покрива дете: "/" покрива всичко под себе си, "/a" покрива "/a/b".
+fn dav_path_under(parent: str, child: str) -> i64 {
+    if parent == child {
+        return 0
+    }
+    if parent == "/" {
+        return 1
+    }
+    if str_starts_with(child, concat(parent, "/")) == 1 {
+        return 1
+    }
+    return 0
+}
+
+// 1, ако заключването пази този път. depth < 0 е infinity.
+// Заключване на дете спира и триене на родителя.
+fn dav_lock_covers(lock_path: str, lock_depth: i64, target: str) -> i64 {
+    if lock_path == target {
+        return 1
+    }
+    if lock_depth < 0 && dav_path_under(lock_path, target) == 1 {
+        return 1
+    }
+    if dav_path_under(target, lock_path) == 1 {
+        return 1
+    }
+    return 0
+}
+
+// Токенът се търси като `<opaquelocktoken:...>`, не като гол низ.
+fn dav_if_has_token(header: str, token: str) -> i64 {
+    if token == "" {
+        return 0
+    }
+    if str_find(header, concat("<", concat(token, ">"))) >= 0 {
+        return 1
+    }
+    return 0
+}
+
+// Second-N или Infinite. Празното е 1 час. Таванът е едно денонощие,
+// за да не остане „вечно" заключване след затворен клиент.
+fn dav_timeout_s(h: str) -> i64 {
+    let s = dav_lower(str_trim(h))
+    if s == "" {
+        return 3600
+    }
+    if str_find(s, "infinite") >= 0 {
+        return 86400
+    }
+    if str_starts_with(s, "second-") == 1 {
+        let n = parse_int(substr(s, 7, len(s)))
+        if n < 30 {
+            return 30
+        }
+        if n > 86400 {
+            return 86400
+        }
+        return n
+    }
+    return 3600
+}
+
+fn dav_wants_shared(body: str) -> i64 {
+    if str_find(body, ":shared") >= 0 {
+        return 1
+    }
+    if str_find(body, "<shared") >= 0 {
+        return 1
+    }
+    return 0
+}
+
+fn dav_lock_xml(href: str, token: str, seconds: i64, owner: str, depth_inf: i64) -> str {
+    let mut depth = "0"
+    if depth_inf == 1 {
+        depth = "infinity"
+    }
+    let mut b = xml_decl()
+    b = concat(b, "<D:prop xmlns:D=\"DAV:\"><D:lockdiscovery><D:activelock>")
+    b = concat(b, "<D:locktype><D:write/></D:locktype><D:lockscope><D:exclusive/></D:lockscope>")
+    b = concat(b, concat("<D:depth>", concat(depth, "</D:depth>")))
+    b = concat(b, concat("<D:owner>", concat(xml_escape_text(owner), "</D:owner>")))
+    b = concat(b, concat("<D:timeout>Second-", concat(int_to_str(seconds), "</D:timeout>")))
+    b = concat(b, concat("<D:locktoken><D:href>", concat(xml_escape_text(token), "</D:href></D:locktoken>")))
+    b = concat(b, concat("<D:lockroot><D:href>", concat(xml_escape_text(dav_href_escape(href)), "</D:href></D:lockroot>")))
+    return concat(b, "</D:activelock></D:lockdiscovery></D:prop>")
+}
+
+fn dav_lockdiscovery(token: str, seconds: i64, owner: str, depth_inf: i64, href: str) -> str {
+    if token == "" {
+        return ""
+    }
+    let mut depth = "0"
+    if depth_inf == 1 {
+        depth = "infinity"
+    }
+    let mut b = "<D:lockdiscovery><D:activelock>"
+    b = concat(b, "<D:locktype><D:write/></D:locktype><D:lockscope><D:exclusive/></D:lockscope>")
+    b = concat(b, concat("<D:depth>", concat(depth, "</D:depth>")))
+    b = concat(b, concat("<D:owner>", concat(xml_escape_text(owner), "</D:owner>")))
+    b = concat(b, concat("<D:timeout>Second-", concat(int_to_str(seconds), "</D:timeout>")))
+    b = concat(b, concat("<D:locktoken><D:href>", concat(xml_escape_text(token), "</D:href></D:locktoken>")))
+    b = concat(b, concat("<D:lockroot><D:href>", concat(xml_escape_text(dav_href_escape(href)), "</D:href></D:lockroot>")))
+    return concat(b, "</D:activelock></D:lockdiscovery>")
+}
+
+fn dav_prop_forbidden(name: str) -> str {
+    let mut b = "<D:propstat><D:prop><D:"
+    b = concat(b, name)
+    b = concat(b, "/></D:prop><D:status>HTTP/1.1 403 Forbidden</D:status></D:propstat>")
+    return b
+}
+
+// Имената вътре в <prop>. Празен резултат = няма какво да се сменя.
+fn dav_proppatch_stats(body: str) -> str {
+    let p = xml_parser(body)
+    let mut in_prop: i64 = 0
+    let mut acc = ""
+    let mut done: i64 = 0
+    while done == 0 {
+        let ev = xml_next(p)
+        if ev.kind == 0 || ev.kind < 0 {
+            done = 1
+        } else {
+            let local = xml_local_name(ev.name)
+            if ev.kind == 1 {
+                if local == "prop" {
+                    in_prop = 1
+                } else {
+                    if in_prop == 1 && local != "" {
+                        acc = concat(acc, dav_prop_forbidden(local))
+                    }
+                }
+            }
+            if ev.kind == 2 && local == "prop" {
+                in_prop = 0
+            }
+        }
+    }
+    return acc
 }
 
 fn dav_multistatus(inner: str) -> str {
