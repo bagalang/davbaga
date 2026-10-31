@@ -297,6 +297,72 @@ fn dav_if_has_token(header: str, token: str) -> i64 {
     return 0
 }
 
+// D2 (RFC 4918 §10.4): парсирай If хедъра и оцени срещу притежаваните токени.
+// Формат: [Not] (<token> [OR <token>...])
+//   - "Not" инвертира цялата скоба
+//   - OR в скобите: поне един токен трябва да съвпада
+//   - няколко скоби (AND): всички трябва да минат
+// held_tokens: списък от притежавани lock токени (празен = няма)
+// Връща 1 ако условието е удовлетворено, 0 ако не, -1 при синтактична грешка.
+fn dav_if_eval(header: str, held_tokens: Vec<str>) -> i64 {
+    let h = str_trim(header)
+    if h == "" {
+        return 1
+    }
+    let mut i: i64 = 0
+    let n = len(h)
+    let mut all_ok: i64 = 1
+    while i < n && all_ok == 1 {
+        let c = char_at(h, i)
+        if c == 32 || c == 9 { i = i + 1; continue }
+        if c == 40 {
+            // отваряща скоба "("
+            i = i + 1
+            let mut neg: i64 = 0
+            while i < n && (char_at(h, i) == 32 || char_at(h, i) == 9) { i = i + 1 }
+            if i + 3 < n && char_at(h, i) == 78 && char_at(h, i + 1) == 111 && char_at(h, i + 2) == 116 {
+                neg = 1
+                i = i + 3
+                while i < n && (char_at(h, i) == 32 || char_at(h, i) == 9) { i = i + 1 }
+            }
+            let mut list_ok: i64 = 0
+            while i < n && char_at(h, i) != 41 {
+                if char_at(h, i) == 32 || char_at(h, i) == 9 { i = i + 1; continue }
+                if char_at(h, i) == 60 {
+                    // <token>
+                    let close = str_find(substr(h, i, n), ">")
+                    if close < 0 { return -1 }
+                    let tok = substr(h, i + 1, i + close)
+                    let mut found: i64 = 0
+                    for k in 0..vec_len(held_tokens) {
+                        if vec_get_str(held_tokens, k) == tok { found = 1; break }
+                    }
+                    if found == 1 { list_ok = 1 }
+                    i = i + close + 1
+                } else if char_at(h, i) == 91 {
+                    // [etag] — пропускаме (не е lock token)
+                    let close = str_find(substr(h, i, n), "]")
+                    if close < 0 { return -1 }
+                    i = i + close + 1
+                } else {
+                    // OR ключова дума (или друга дума) — прескачаме до следващата
+                    while i < n && char_at(h, i) != 32 && char_at(h, i) != 9 &&
+                          char_at(h, i) != 60 && char_at(h, i) != 91 && char_at(h, i) != 41 {
+                        i = i + 1
+                    }
+                }
+            }
+            if i >= n { return -1 }
+            i = i + 1
+            if neg == 1 { list_ok = 1 - list_ok }
+            if list_ok == 0 { all_ok = 0 }
+        } else {
+            return -1
+        }
+    }
+    return all_ok
+}
+
 // Second-N или Infinite. Празното е 1 час. Таванът е едно денонощие,
 // за да не остане „вечно" заключване след затворен клиент.
 fn dav_timeout_s(h: str) -> i64 {
@@ -330,14 +396,27 @@ fn dav_wants_shared(body: str) -> i64 {
     return 0
 }
 
+// lock_scope: "exclusive" или "shared" (RFC 4918 §6.5). Празно = exclusive.
+fn dav_scope_xml(scope: str) -> str {
+    if scope == "shared" {
+        return "<D:lockscope><D:shared/></D:lockscope>"
+    }
+    return "<D:lockscope><D:exclusive/></D:lockscope>"
+}
+
 fn dav_lock_xml(href: str, token: str, seconds: i64, owner: str, depth_inf: i64) -> str {
+    return dav_lock_xml_scoped(href, token, seconds, owner, depth_inf, "exclusive")
+}
+
+fn dav_lock_xml_scoped(href: str, token: str, seconds: i64, owner: str, depth_inf: i64, scope: str) -> str {
     let mut depth = "0"
     if depth_inf == 1 {
         depth = "infinity"
     }
     let mut b = xml_decl()
     b = concat(b, "<D:prop xmlns:D=\"DAV:\"><D:lockdiscovery><D:activelock>")
-    b = concat(b, "<D:locktype><D:write/></D:locktype><D:lockscope><D:exclusive/></D:lockscope>")
+    b = concat(b, "<D:locktype><D:write/></D:locktype>")
+    b = concat(b, dav_scope_xml(scope))
     b = concat(b, concat("<D:depth>", concat(depth, "</D:depth>")))
     b = concat(b, concat("<D:owner>", concat(xml_escape_text(owner), "</D:owner>")))
     b = concat(b, concat("<D:timeout>Second-", concat(int_to_str(seconds), "</D:timeout>")))
@@ -347,6 +426,10 @@ fn dav_lock_xml(href: str, token: str, seconds: i64, owner: str, depth_inf: i64)
 }
 
 fn dav_lockdiscovery(token: str, seconds: i64, owner: str, depth_inf: i64, href: str) -> str {
+    return dav_lockdiscovery_scoped(token, seconds, owner, depth_inf, href, "exclusive")
+}
+
+fn dav_lockdiscovery_scoped(token: str, seconds: i64, owner: str, depth_inf: i64, href: str, scope: str) -> str {
     if token == "" {
         return ""
     }
@@ -355,7 +438,8 @@ fn dav_lockdiscovery(token: str, seconds: i64, owner: str, depth_inf: i64, href:
         depth = "infinity"
     }
     let mut b = "<D:lockdiscovery><D:activelock>"
-    b = concat(b, "<D:locktype><D:write/></D:locktype><D:lockscope><D:exclusive/></D:lockscope>")
+    b = concat(b, "<D:locktype><D:write/></D:locktype>")
+    b = concat(b, dav_scope_xml(scope))
     b = concat(b, concat("<D:depth>", concat(depth, "</D:depth>")))
     b = concat(b, concat("<D:owner>", concat(xml_escape_text(owner), "</D:owner>")))
     b = concat(b, concat("<D:timeout>Second-", concat(int_to_str(seconds), "</D:timeout>")))
@@ -405,4 +489,57 @@ fn dav_multistatus(inner: str) -> str {
     b = concat(b, "<D:multistatus xmlns:D=\"DAV:\">")
     b = concat(b, inner)
     return concat(b, "</D:multistatus>")
+}
+
+// D3 (closed 2026-10-31): lock-null ресурс по RFC 4918 §7.3 — LOCK върху
+// несъществуващ URL създава "празен" ресурс, който PROPFIND вижда.
+// Тук: 1 ако href е в списъка на lock-null (заключен, но не е файл/dir).
+fn dav_is_lock_null(href: str, lock_null_paths: Vec<str>) -> i64 {
+    for k in 0..vec_len(lock_null_paths) {
+        if vec_get_str(lock_null_paths, k) == href {
+            return 1
+        }
+    }
+    return 0
+}
+
+// PROPFIND отговор за lock-null ресурс: празен resourcetype + lockdiscovery.
+// size=0, mime="", etag="" — ресурсът още няма съдържание.
+fn dav_locknull_response(href: str, token: str, seconds: i64, owner: str, depth_inf: i64) -> str {
+    let ld = dav_lockdiscovery_scoped(token, seconds, owner, depth_inf, href, "exclusive")
+    let mut b = "<D:response><D:href>"
+    b = concat(b, xml_escape_text(dav_href_escape(href)))
+    b = concat(b, "</D:href><D:propstat><D:prop>")
+    b = concat(b, "<D:displayname>")
+    b = concat(b, xml_escape_text(href))
+    b = concat(b, "</D:displayname>")
+    b = concat(b, "<D:resourcetype/>")
+    b = concat(b, "<D:getcontentlength>0</D:getcontentlength>")
+    b = concat(b, ld)
+    b = concat(b, "</D:prop><D:status>")
+    b = concat(b, dav_status(200))
+    b = concat(b, "</D:status></D:propstat></D:response>")
+    return b
+}
+
+// Добавя lock-null href към списъка, ако го няма. Връща новия списък.
+fn dav_locknull_add(paths: Vec<str>, href: str) -> Vec<str> {
+    if dav_is_lock_null(href, paths) == 1 {
+        return paths
+    }
+    let mut out = paths
+    vec_push(out, href)
+    return out
+}
+
+// Сваля lock-null href от списъка (при PUT, който създава реален ресурс).
+fn dav_locknull_remove(paths: Vec<str>, href: str) -> Vec<str> {
+    let mut out: Vec<str> = vec_new()
+    for k in 0..vec_len(paths) {
+        let p = vec_get_str(paths, k)
+        if p != href {
+            vec_push(out, p)
+        }
+    }
+    return out
 }
